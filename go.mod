@@ -1,6 +1,5 @@
 module github.com/scut2024hjt/locache
 
-
 go 1.22
 
 toolchain go1.22.11

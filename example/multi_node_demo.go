@@ -1,3 +1,10 @@
+//go:build ignore
+
+// 独立示例程序：单独运行，例如
+//   go run example/multi_node_demo.go -port 8001 -api 9001
+//
+// 该文件不会被 go build ./... 编译（与同目录其他示例的 main 不冲突）。
+
 package main
 
 import (
