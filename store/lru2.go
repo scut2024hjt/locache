@@ -1,7 +1,6 @@
 package store
 
 import (
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,33 +56,29 @@ func (s *lru2Store) Get(key string) (Value, bool) {
 
 	currentTime := Now()
 
-	// 首先检查一级缓存
-	n1, status1, expireAt := s.caches[idx][0].del(key)
-	if status1 > 0 {
-		// 从一级缓存找到项目
-		if expireAt > 0 && currentTime >= expireAt {
-			// 项目已过期，删除它
+	// 先查一级缓存（peek 为只读查询，不会修改节点的 expireAt）
+	if n1 := s.caches[idx][0].peek(key); n1 != nil {
+		if n1.expireAt > 0 && currentTime >= n1.expireAt {
 			s.delete(key, idx)
-			fmt.Println("找到项目已过期，删除它")
 			return nil, false
 		}
-
-		// 项目有效，将其移至二级缓存
-		s.caches[idx][1].put(key, n1.v, expireAt, s.onEvicted)
-		fmt.Println("项目有效，将其移至二级缓存")
+		// 一级缓存命中：保留在容量较小的一级缓存中，作为热点数据。
+		// 注意这里必须用 peek：早期实现用 del() 取值，del 会把 expireAt 置 0，
+		// 导致写入二级缓存的副本被 _get 判定为已失效，数据实际丢失。
+		s.caches[idx][0].get(key) // 刷新到链表头部（LRU）
 		return n1.v, true
 	}
 
-	// 一级缓存未找到，检查二级缓存
-	n2, status2 := s._get(key, idx, 1)
-	if status2 > 0 && n2 != nil {
+	// 一级缓存未命中，再查二级缓存
+	if n2 := s.caches[idx][1].peek(key); n2 != nil {
 		if n2.expireAt > 0 && currentTime >= n2.expireAt {
-			// 项目已过期，删除它
 			s.delete(key, idx)
-			fmt.Println("找到项目已过期，删除它")
 			return nil, false
 		}
-
+		// 二级缓存命中说明该键再次被访问，晋升回一级缓存
+		if n, st, expireAt := s.caches[idx][1].del(key); st > 0 && n != nil {
+			s.caches[idx][0].put(key, n.v, expireAt, s.onEvicted)
+		}
 		return n2.v, true
 	}
 
@@ -285,6 +280,15 @@ func (c *cache) put(key string, val Value, expireAt int64, onEvicted func(string
 	c.dlnk[0][n] = c.last
 
 	return 1
+}
+
+// peek 只读地查询键对应的节点，不修改 expireAt、不调整 LRU 顺序。
+// 用于读取值但不想改变缓存状态或标记删除的场景。
+func (c *cache) peek(key string) *node {
+	if idx, ok := c.hmap[key]; ok && c.m[idx-1].expireAt > 0 {
+		return &c.m[idx-1]
+	}
+	return nil
 }
 
 // 从缓存中获取键对应的节点和状态
