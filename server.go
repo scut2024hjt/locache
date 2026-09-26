@@ -13,9 +13,12 @@ import (
 	"github.com/scut2024hjt/locache/registry"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 type Server struct {
@@ -188,6 +191,22 @@ func (s *Server) Stop() {
 	})
 }
 
+func mapGroupError(err error) error {
+	if err == nil {
+		return nil
+	}
+	switch {
+	case errors.Is(err, ErrNotOwner), errors.Is(err, ErrTopologyChanged), errors.Is(err, ErrNoOwner):
+		return status.Error(codes.FailedPrecondition, err.Error())
+	case errors.Is(err, ErrCacheMiss):
+		return status.Error(codes.NotFound, err.Error())
+	case errors.Is(err, ErrGroupClosed):
+		return status.Error(codes.Unavailable, err.Error())
+	default:
+		return err
+	}
+}
+
 // Get is deliberately local-only. The caller already selected this node as the
 // owner, so peer requests cannot recursively re-enter distributed routing.
 func (s *Server) Get(ctx context.Context, req *pb.Request) (*pb.ResponseForGet, error) {
@@ -197,7 +216,7 @@ func (s *Server) Get(ctx context.Context, req *pb.Request) (*pb.ResponseForGet, 
 	}
 	view, err := group.getLocal(ctx, req.Key)
 	if err != nil {
-		return nil, err
+		return nil, mapGroupError(err)
 	}
 	return &pb.ResponseForGet{Value: view.ByteSlice()}, nil
 }
@@ -209,7 +228,7 @@ func (s *Server) Set(_ context.Context, req *pb.Request) (*pb.ResponseForGet, er
 		return nil, fmt.Errorf("group %s not found", req.Group)
 	}
 	if err := group.setLocal(req.Key, req.Value); err != nil {
-		return nil, err
+		return nil, mapGroupError(err)
 	}
 	return &pb.ResponseForGet{Value: req.Value}, nil
 }
@@ -217,12 +236,23 @@ func (s *Server) Set(_ context.Context, req *pb.Request) (*pb.ResponseForGet, er
 // Delete is an idempotent local eviction. Public Group.Delete uses it for the
 // owner mutation, and mutation invalidation reuses it on non-owner peers to
 // drop near-cache or stale previous-owner copies without recursive routing.
-func (s *Server) Delete(_ context.Context, req *pb.Request) (*pb.ResponseForDelete, error) {
+func (s *Server) Delete(ctx context.Context, req *pb.Request) (*pb.ResponseForDelete, error) {
 	group := GetGroup(req.Group)
 	if group == nil {
 		return nil, fmt.Errorf("group %s not found", req.Group)
 	}
-	removed := group.deleteLocal(req.Key)
+
+	// Replica invalidation is deliberately local-only and may target a
+	// non-owner. A normal distributed Delete, however, must still be rejected
+	// by an old owner so the requester can re-resolve the current owner.
+	if md, ok := metadata.FromIncomingContext(ctx); ok && len(md.Get(peerInvalidationMetadataKey)) > 0 {
+		return &pb.ResponseForDelete{Value: group.deleteLocal(req.Key)}, nil
+	}
+
+	removed, err := group.deleteOwnerLocal(req.Key)
+	if err != nil {
+		return nil, mapGroupError(err)
+	}
 	return &pb.ResponseForDelete{Value: removed}, nil
 }
 

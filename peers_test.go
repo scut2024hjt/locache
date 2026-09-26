@@ -46,12 +46,12 @@ func TestPickersWithSameMembershipChooseSameOwner(t *testing.T) {
 
 	for i := 0; i < 2000; i++ {
 		key := fmt.Sprintf("key-%d", i)
-		owner0, _, _, ok := pickers[0].PickOwner(key)
+		owner0, _, _, _, ok := pickers[0].PickOwner(key)
 		if !ok {
 			t.Fatalf("no owner for %s", key)
 		}
 		for _, p := range pickers[1:] {
-			owner, _, _, ok := p.PickOwner(key)
+			owner, _, _, _, ok := p.PickOwner(key)
 			if !ok || owner != owner0 {
 				t.Fatalf("inconsistent owner for %s: %s vs %s", key, owner0, owner)
 			}

@@ -17,6 +17,11 @@ import (
 // stubs. These tests instead put a real gRPC server and a real Client on a
 // loopback socket, so client.go, the protobuf codec and the Server handlers are
 // all exercised on the wire path.
+//
+// v3 note: the owner-local path now verifies that this node really is the
+// current owner, so a group that claims a remote owner is refused with
+// ErrNotOwner. The requester-side routing is covered by group_test.go; here we
+// keep the *server side* owning the keys and talk to it through a real Client.
 
 // startRawGRPCServer starts a locache gRPC server without etcd. Server.Get/Set/
 // Delete only need the group registry, so no lease or membership is required.
@@ -37,7 +42,8 @@ func startRawGRPCServer(t *testing.T) string {
 	return lis.Addr().String()
 }
 
-// realPeerPicker always routes to a remote owner reached over gRPC.
+// realPeerPicker routes keys to an owner address. When owner == self the node
+// believes it owns every key; otherwise the owner is reached over gRPC.
 type realPeerPicker struct {
 	self  string
 	owner string
@@ -45,11 +51,12 @@ type realPeerPicker struct {
 	epoch atomic.Uint64
 }
 
-func (p *realPeerPicker) PickOwner(string) (string, Peer, bool, bool) {
+func (p *realPeerPicker) PickOwner(string) (string, Peer, bool, uint64, bool) {
+	epoch := p.epoch.Load()
 	if p.owner == p.self {
-		return p.owner, nil, true, true
+		return p.owner, nil, true, epoch, true
 	}
-	return p.owner, p.peer, false, true
+	return p.owner, p.peer, false, epoch, true
 }
 
 func (p *realPeerPicker) Epoch() uint64 { return p.epoch.Load() }
@@ -58,6 +65,9 @@ func (p *realPeerPicker) Invalidate(context.Context, string, string, string) err
 
 func (p *realPeerPicker) Close() error { return nil }
 
+// TestGRPCWirePathReadThroughSetDelete drives Get/Set/Delete through a real
+// gRPC Client against a real Server: protobuf round-trip, handler dispatch and
+// the owner cache are all on the wire path.
 func TestGRPCWirePathReadThroughSetDelete(t *testing.T) {
 	cleanupGroups(t)
 	addr := startRawGRPCServer(t)
@@ -68,59 +78,51 @@ func TestGRPCWirePathReadThroughSetDelete(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 
 	var loads atomic.Int64
-	picker := &realPeerPicker{self: "requester-node", owner: addr, peer: client}
+	picker := &realPeerPicker{self: addr, owner: addr, peer: client}
 	picker.epoch.Store(1)
 
-	g := NewGroup("grpc-e2e", 1<<20, GetterFunc(func(context.Context, string) ([]byte, error) {
+	NewGroup("grpc-e2e", 1<<20, GetterFunc(func(context.Context, string) ([]byte, error) {
 		loads.Add(1)
 		return []byte("owner-source"), nil
-	}), WithPeers(picker), WithExpiration(time.Minute), WithNearCache(64<<10, time.Minute))
+	}), WithPeers(picker), WithExpiration(time.Minute))
 
-	// Read-through: the requester must reach the owner over gRPC, load from the
-	// source once, and satisfy the second read from the near cache.
+	// Read-through over gRPC, then a second read served by the owner cache.
 	for i := 0; i < 2; i++ {
-		view, err := g.Get(context.Background(), "k")
-		if err != nil || view.String() != "owner-source" {
-			t.Fatalf("get #%d=%q err=%v", i, view.String(), err)
+		view, err := client.Get(context.Background(), "grpc-e2e", "k")
+		if err != nil || string(view) != "owner-source" {
+			t.Fatalf("grpc get #%d=%q err=%v", i, string(view), err)
 		}
 	}
 	if loads.Load() != 1 {
 		t.Fatalf("owner source loads=%d, want 1", loads.Load())
 	}
-	if got := g.nearCache.Len(); got != 1 {
-		t.Fatalf("near cache entries=%d, want 1", got)
-	}
 
-	// Set is a real gRPC mutation of the owner plus a writer-side near-cache
-	// refresh, so the following Get must not need another RPC.
-	if err := g.Set(context.Background(), "k2", []byte("v2")); err != nil {
-		t.Fatalf("set over grpc: %v", err)
+	// Set over gRPC, then read the value back from the owner cache.
+	if err := client.Set(context.Background(), "grpc-e2e", "k2", []byte("v2")); err != nil {
+		t.Fatalf("grpc set: %v", err)
 	}
-	view, err := g.Get(context.Background(), "k2")
-	if err != nil || view.String() != "v2" {
-		t.Fatalf("get after set=%q err=%v", view.String(), err)
+	if view, err := client.Get(context.Background(), "grpc-e2e", "k2"); err != nil || string(view) != "v2" {
+		t.Fatalf("grpc get after set=%q err=%v", string(view), err)
 	}
 	if loads.Load() != 1 {
-		t.Fatalf("writer near cache did not absorb the read: loads=%d", loads.Load())
+		t.Fatalf("set should not reload from source: loads=%d", loads.Load())
 	}
 
-	// Delete evicts the owner copy over gRPC and drops the local near-cache
-	// entry; the next read therefore has to go back to the source.
-	if err := g.Delete(context.Background(), "k2"); err != nil {
-		t.Fatalf("delete over grpc: %v", err)
+	// Delete over gRPC evicts the owner copy; the next read reloads the source.
+	removed, err := client.Delete(context.Background(), "grpc-e2e", "k2")
+	if err != nil || !removed {
+		t.Fatalf("grpc delete removed=%v err=%v", removed, err)
 	}
-	if _, ok := g.nearCache.Get(context.Background(), g.nearKey(picker.Epoch(), "k2")); ok {
-		t.Fatal("near cache still holds the deleted key")
-	}
-	view, err = g.Get(context.Background(), "k2")
-	if err != nil || view.String() != "owner-source" {
-		t.Fatalf("get after delete=%q err=%v", view.String(), err)
+	if view, err := client.Get(context.Background(), "grpc-e2e", "k2"); err != nil || string(view) != "owner-source" {
+		t.Fatalf("grpc get after delete=%q err=%v", string(view), err)
 	}
 	if loads.Load() != 2 {
 		t.Fatalf("owner source loads after delete=%d, want 2", loads.Load())
 	}
 }
 
+// TestGRPCWirePathPropagatesOwnerErrors covers the error paths a remote caller
+// observes: owner miss, non-owner refusal and unknown group.
 func TestGRPCWirePathPropagatesOwnerErrors(t *testing.T) {
 	cleanupGroups(t)
 	addr := startRawGRPCServer(t)
@@ -130,16 +132,40 @@ func TestGRPCWirePathPropagatesOwnerErrors(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = client.Close() })
 
-	picker := &realPeerPicker{self: "requester-node", owner: addr, peer: client}
-	picker.epoch.Store(1)
-
-	// Explicit cache mode: an owner miss is reported as ErrCacheMiss and must
-	// travel back over gRPC as an error rather than an empty value.
-	g := NewGroup("grpc-e2e-miss", 1<<20, nil, WithPeers(picker), WithExpiration(time.Minute))
-	if _, err := g.Get(context.Background(), "absent"); err == nil {
-		t.Fatal("expected remote miss to return an error")
+	// Explicit cache mode on the owner: a miss must come back as an error
+	// rather than an empty successful value.
+	ownerPicker := &realPeerPicker{self: addr, owner: addr, peer: client}
+	ownerPicker.epoch.Store(1)
+	NewGroup("grpc-e2e-miss", 1<<20, nil, WithPeers(ownerPicker), WithExpiration(time.Minute))
+	if _, err := client.Get(context.Background(), "grpc-e2e-miss", "absent"); err == nil {
+		t.Fatal("expected owner miss to return an error")
 	} else if !strings.Contains(err.Error(), "cache miss") {
-		t.Fatalf("miss error=%v, want ErrCacheMiss text", err)
+		t.Fatalf("miss error=%v, want cache-miss text", err)
+	}
+
+	// A node that is not the owner must refuse to serve the key, and the
+	// rejection must not silently fall back to the local Getter. The gRPC layer
+	// translates ownership/topology rejection back to ErrTopologyChanged.
+	var localLoads atomic.Int64
+	nonOwner := &realPeerPicker{self: "requester-node", owner: addr, peer: client}
+	nonOwner.epoch.Store(1)
+	NewGroup("grpc-e2e-not-owner", 1<<20, GetterFunc(func(context.Context, string) ([]byte, error) {
+		localLoads.Add(1)
+		return []byte("must-not-be-served"), nil
+	}), WithPeers(nonOwner), WithExpiration(time.Minute))
+
+	_, err = client.Get(context.Background(), "grpc-e2e-not-owner", "k")
+	if err == nil {
+		t.Fatal("expected non-owner node to refuse the request")
+	}
+	if !strings.Contains(err.Error(), "not the current owner") {
+		t.Fatalf("refusal error=%v, want ownership rejection", err)
+	}
+	if localLoads.Load() != 0 {
+		t.Fatalf("non-owner served the key from its local Getter %d times", localLoads.Load())
+	}
+	if !errors.Is(err, ErrTopologyChanged) {
+		t.Errorf("ownership rejection error=%v, want ErrTopologyChanged", err)
 	}
 
 	// The Server must report unknown groups instead of panicking.

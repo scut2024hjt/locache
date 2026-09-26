@@ -48,3 +48,18 @@ func TestShardedLRUConcurrent(t *testing.T) {
 		t.Fatal("cache unexpectedly empty")
 	}
 }
+
+func TestTinyTotalBudgetReducesShardCount(t *testing.T) {
+	s := newShardedLRU(Options{MaxBytes: 16, ShardCount: 16, CleanupInterval: time.Minute})
+	defer s.Close()
+	if len(s.shards) != 1 {
+		t.Fatalf("tiny budget created %d shards, want 1", len(s.shards))
+	}
+	if err := s.Set("k", testValue("hello")); err != nil {
+		t.Fatal(err)
+	}
+	v, ok := s.Get("k")
+	if !ok || string(v.(testValue)) != "hello" {
+		t.Fatalf("tiny-budget get=%v ok=%v", v, ok)
+	}
+}

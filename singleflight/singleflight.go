@@ -39,14 +39,20 @@ func (g *Group) Do(key string, fn func() (interface{}, error)) (interface{}, err
 			if r := recover(); r != nil {
 				c.panicVal = r
 			}
-			c.wg.Done()
 		}()
 		c.val, c.err = fn()
 	}()
 
+	// Remove the completed call before waking waiters. A new caller arriving
+	// after fn has completed should start a new call rather than accidentally
+	// reusing the just-finished result during a tiny cleanup window.
 	g.mu.Lock()
-	delete(g.m, key)
+	if g.m[key] == c {
+		delete(g.m, key)
+	}
 	g.mu.Unlock()
+	c.wg.Done()
+
 	if c.panicVal != nil {
 		panic(c.panicVal)
 	}

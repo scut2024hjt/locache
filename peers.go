@@ -20,7 +20,7 @@ const defaultSvcName = "locache"
 
 type PeerPicker interface {
 	// PickOwner returns the owner address. peer is nil when the owner is self.
-	PickOwner(key string) (owner string, peer Peer, self bool, ok bool)
+	PickOwner(key string) (owner string, peer Peer, self bool, epoch uint64, ok bool)
 	// Epoch changes whenever this picker observes a membership change. Groups
 	// use it to isolate requester-side near-cache entries across remapping.
 	Epoch() uint64
@@ -325,22 +325,23 @@ func (p *ClientPicker) removeMember(addr string) {
 	logrus.Infof("locache member removed: %s", addr)
 }
 
-func (p *ClientPicker) PickOwner(key string) (string, Peer, bool, bool) {
+func (p *ClientPicker) PickOwner(key string) (string, Peer, bool, uint64, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	owner := p.ring.Get(key)
+	epoch := p.epoch.Load()
 	if owner == "" {
-		return "", nil, false, false
+		return "", nil, false, epoch, false
 	}
 	if owner == p.selfAddr {
-		return owner, nil, true, true
+		return owner, nil, true, epoch, true
 	}
-	return owner, p.clients[owner], false, true
+	return owner, p.clients[owner], false, epoch, true
 }
 
 func (p *ClientPicker) Invalidate(ctx context.Context, group, key, exceptOwner string) error {
 	p.mu.RLock()
-	targets := make([]Peer, 0, len(p.clients))
+	targets := make([]*Client, 0, len(p.clients))
 	targetAddrs := make([]string, 0, len(p.clients))
 	for addr, client := range p.clients {
 		if addr == exceptOwner {
@@ -362,7 +363,7 @@ func (p *ClientPicker) Invalidate(ctx context.Context, group, key, exceptOwner s
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := peer.Delete(ctx, group, key); err != nil {
+			if err := peer.Invalidate(ctx, group, key); err != nil {
 				errCh <- fmt.Errorf("invalidate %s: %w", addr, err)
 			}
 		}()

@@ -3,12 +3,15 @@ package locache
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	pb "github.com/scut2024hjt/locache/pb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type fakePeer struct {
@@ -54,14 +57,20 @@ func newFakePicker(owner, self string, peer Peer) *fakePicker {
 	p.epoch.Store(1)
 	return p
 }
-func (p *fakePicker) PickOwner(string) (string, Peer, bool, bool) {
+func (p *fakePicker) PickOwner(string) (string, Peer, bool, uint64, bool) {
+	epoch := p.epoch.Load()
 	if p.owner == "" {
-		return "", nil, false, false
+		return "", nil, false, epoch, false
 	}
 	if p.owner == p.self {
-		return p.owner, nil, true, true
+		return p.owner, nil, true, epoch, true
 	}
-	return p.owner, p.peer, false, true
+	return p.owner, p.peer, false, epoch, true
+}
+
+func (p *fakePicker) setOwner(owner string) {
+	p.owner = owner
+	p.epoch.Add(1)
 }
 func (p *fakePicker) Epoch() uint64                                            { return p.epoch.Load() }
 func (p *fakePicker) Invalidate(context.Context, string, string, string) error { return nil }
@@ -236,7 +245,9 @@ func TestHotCacheProvidesBoundedStaleness(t *testing.T) {
 func TestServerGetUsesOwnerLocalPathWithoutRerouting(t *testing.T) {
 	cleanupGroups(t)
 	peer := &fakePeer{value: []byte("wrong-peer")}
-	picker := newFakePicker("remote", "self", peer)
+	// v3 起 owner-local 路径会校验"本节点是不是当前 Owner"，所以这里必须让
+	// picker 认为本节点就是 Owner；非 Owner 拒服由下一个用例覆盖。
+	picker := newFakePicker("self", "self", peer)
 	g := NewGroup("server-local", 1<<20, GetterFunc(func(context.Context, string) ([]byte, error) {
 		return []byte("owner-source"), nil
 	}), WithPeers(picker), WithExpiration(time.Minute))
@@ -277,6 +288,31 @@ func (p *ownerBackedPeer) Delete(_ context.Context, _ string, key string) (bool,
 	return p.owner.deleteLocal(key), nil
 }
 func (p *ownerBackedPeer) Close() error { return nil }
+
+// v3 新增语义：不是 Owner 的节点必须拒绝 owner-local 请求，而不是擅自回源。
+func TestServerGetRejectsRequestWhenNotOwner(t *testing.T) {
+	cleanupGroups(t)
+	peer := &fakePeer{value: []byte("wrong-peer")}
+	picker := newFakePicker("remote", "self", peer)
+	var loads atomic.Int64
+	NewGroup("server-not-owner", 1<<20, GetterFunc(func(context.Context, string) ([]byte, error) {
+		loads.Add(1)
+		return []byte("owner-source"), nil
+	}), WithPeers(picker), WithExpiration(time.Minute))
+
+	s := &Server{}
+	// v4+ maps ownership rejection to a stable gRPC status; the client
+	// classifies FailedPrecondition back into ErrTopologyChanged.
+	if _, err := s.Get(context.Background(), &pb.Request{Group: "server-not-owner", Key: "k"}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("non-owner server error=%v, want codes.FailedPrecondition", err)
+	}
+	if peer.calls.Load() != 0 {
+		t.Fatalf("non-owner server rerouted the request %d times", peer.calls.Load())
+	}
+	if loads.Load() != 0 {
+		t.Fatalf("non-owner server loaded from its own source %d times", loads.Load())
+	}
+}
 
 func TestRequestsFromRemoteNodesConvergeOnOwnerSingleflight(t *testing.T) {
 	cleanupGroups(t)
@@ -409,5 +445,186 @@ func TestRemoteDeleteEvictsWriterNearCache(t *testing.T) {
 	}
 	if _, ok := requester.nearCache.Get(context.Background(), requester.nearKey(picker.Epoch(), "k")); ok {
 		t.Fatal("requester near-cache still contains deleted key")
+	}
+}
+
+func TestInflightLoadDoesNotOverwriteConcurrentSet(t *testing.T) {
+	cleanupGroups(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	g := NewGroup("inflight-set", 1<<20, GetterFunc(func(context.Context, string) ([]byte, error) {
+		once.Do(func() { close(started) })
+		<-release
+		return []byte("stale-from-source"), nil
+	}))
+
+	result := make(chan ByteView, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		v, err := g.Get(context.Background(), "k")
+		result <- v
+		errCh <- err
+	}()
+	<-started
+	if err := g.Set(context.Background(), "k", []byte("fresh")); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-errCh; err != nil {
+		t.Fatalf("inflight get returned err: %v", err)
+	}
+	if got := (<-result).String(); got != "fresh" {
+		t.Fatalf("inflight get=%q, want fresh", got)
+	}
+	v, err := g.Get(context.Background(), "k")
+	if err != nil || v.String() != "fresh" {
+		t.Fatalf("final get=%q err=%v, want fresh", v.String(), err)
+	}
+}
+
+func TestInflightLoadDoesNotResurrectDeletedEntry(t *testing.T) {
+	cleanupGroups(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int64
+	g := NewGroup("inflight-delete", 1<<20, GetterFunc(func(context.Context, string) ([]byte, error) {
+		call := calls.Add(1)
+		if call == 1 {
+			close(started)
+			<-release
+			return []byte("stale-from-source"), nil
+		}
+		return nil, errors.New("source no longer has key")
+	}))
+
+	firstErr := make(chan error, 1)
+	go func() {
+		_, err := g.Get(context.Background(), "k")
+		firstErr <- err
+	}()
+	<-started
+	if err := g.Delete(context.Background(), "k"); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-firstErr; !errors.Is(err, ErrCacheMiss) {
+		t.Fatalf("superseded inflight get err=%v, want ErrCacheMiss", err)
+	}
+	if _, ok := g.mainCache.Get(context.Background(), "k"); ok {
+		t.Fatal("deleted key was resurrected in owner cache")
+	}
+	if _, err := g.Get(context.Background(), "k"); err == nil {
+		t.Fatal("second get unexpectedly succeeded after source deletion")
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("source calls=%d, want 2", calls.Load())
+	}
+}
+
+func TestOwnerCacheIsInvalidatedAcrossMembershipEpochs(t *testing.T) {
+	cleanupGroups(t)
+	var source atomic.Value
+	source.Store("v1")
+	picker := newFakePicker("self", "self", nil)
+	g := NewGroup("owner-epoch", 1<<20, GetterFunc(func(context.Context, string) ([]byte, error) {
+		return []byte(source.Load().(string)), nil
+	}), WithPeers(picker))
+
+	first, err := g.Get(context.Background(), "k")
+	if err != nil || first.String() != "v1" {
+		t.Fatalf("first=%q err=%v", first.String(), err)
+	}
+	picker.setOwner("other")
+	source.Store("v2")
+	picker.setOwner("self")
+
+	second, err := g.Get(context.Background(), "k")
+	if err != nil || second.String() != "v2" {
+		t.Fatalf("after ownership return=%q err=%v, want v2", second.String(), err)
+	}
+}
+
+type callbackPeer struct {
+	mu      sync.Mutex
+	values  [][]byte
+	calls   int
+	onFirst func()
+}
+
+func (p *callbackPeer) Get(context.Context, string, string) ([]byte, error) {
+	p.mu.Lock()
+	idx := p.calls
+	p.calls++
+	var value []byte
+	if idx < len(p.values) {
+		value = cloneBytes(p.values[idx])
+	} else {
+		value = cloneBytes(p.values[len(p.values)-1])
+	}
+	cb := p.onFirst
+	if idx == 0 {
+		p.onFirst = nil
+	}
+	p.mu.Unlock()
+	if cb != nil {
+		cb()
+	}
+	return value, nil
+}
+func (p *callbackPeer) Set(context.Context, string, string, []byte) error    { return nil }
+func (p *callbackPeer) Delete(context.Context, string, string) (bool, error) { return true, nil }
+func (p *callbackPeer) Close() error                                         { return nil }
+
+func TestRemoteReadRetriesWhenMembershipEpochChanges(t *testing.T) {
+	cleanupGroups(t)
+	picker := newFakePicker("remote", "self", nil)
+	peer := &callbackPeer{values: [][]byte{[]byte("old-topology"), []byte("new-topology")}}
+	picker.peer = peer
+	peer.onFirst = func() { picker.epoch.Add(1) }
+	g := NewGroup("near-epoch-race", 1<<20, nil,
+		WithPeers(picker), WithNearCache(64<<10, time.Minute))
+
+	v, err := g.Get(context.Background(), "k")
+	if err != nil || v.String() != "new-topology" {
+		t.Fatalf("get=%q err=%v, want retried new-topology value", v.String(), err)
+	}
+	peer.mu.Lock()
+	calls := peer.calls
+	peer.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("peer calls=%d, want 2 after epoch change", calls)
+	}
+	if _, ok := g.nearCache.Get(context.Background(), g.nearKey(picker.Epoch(), "k")); !ok {
+		t.Fatal("stable-epoch result was not cached")
+	}
+}
+
+func TestRemoteOwnerRejectionIsRetried(t *testing.T) {
+	cleanupGroups(t)
+	peer := &fakePeer{err: fmt.Errorf("get from owner: %w", ErrNotOwner)}
+	picker := newFakePicker("remote", "self", peer)
+	g := NewGroup("remote-owner-retry", 1<<20, nil, WithPeers(picker))
+
+	_, err := g.Get(context.Background(), "k")
+	if calls := peer.calls.Load(); calls < 2 {
+		t.Fatalf("remote owner rejection was not retried: calls=%d", calls)
+	}
+	if !errors.Is(err, ErrTopologyChanged) {
+		t.Fatalf("final error=%v, want ErrTopologyChanged", err)
+	}
+}
+func TestNilContextOnTopologyRetry(t *testing.T) {
+	cleanupGroups(t)
+	peer := &fakePeer{err: fmt.Errorf("get from owner: %w", ErrNotOwner)}
+	picker := newFakePicker("remote", "self", peer)
+	g := NewGroup("nil-context-retry", 1<<20, nil, WithPeers(picker))
+
+	_, err := g.Get(nil, "k")
+	if !errors.Is(err, ErrTopologyChanged) {
+		t.Fatalf("Get(nil) error=%v, want ErrTopologyChanged", err)
+	}
+	if calls := peer.calls.Load(); calls < 2 {
+		t.Fatalf("Get(nil) did not exercise retry path: calls=%d", calls)
 	}
 }

@@ -25,6 +25,8 @@ var (
 	ErrCacheMiss       = errors.New("cache miss")
 	ErrNoOwner         = errors.New("no cache owner available")
 	ErrPeerUnavailable = errors.New("cache owner is remote but no peer client is available")
+	ErrTopologyChanged = errors.New("cache membership changed during operation")
+	ErrNotOwner        = errors.New("this node is not the current owner")
 )
 
 // Getter optionally loads data from the source of truth when the owner cache
@@ -57,6 +59,18 @@ type Group struct {
 	expiration time.Duration
 	closed     int32
 	stats      groupStats
+
+	ownerEpochMu sync.Mutex
+	ownerEpoch   uint64
+
+	keyStatesMu sync.Mutex
+	keyStates   map[string]*keyMutationState
+}
+
+type keyMutationState struct {
+	mu         sync.Mutex
+	generation uint64
+	refs       int
 }
 
 type groupStats struct {
@@ -116,16 +130,19 @@ func WithHotCache(maxBytes int64, ttl time.Duration) GroupOption {
 
 func NewGroup(name string, cacheBytes int64, getter Getter, opts ...GroupOption) *Group {
 	g := &Group{
-		name:   name,
-		getter: getter,
-		loader: &singleflight.Group{},
+		name:      name,
+		getter:    getter,
+		loader:    &singleflight.Group{},
+		keyStates: make(map[string]*keyMutationState),
 	}
 	for _, opt := range opts {
 		opt(g)
 	}
 	if g.mainCache == nil {
 		cacheOpts := DefaultCacheOptions()
-		cacheOpts.MaxBytes = cacheBytes
+		if cacheBytes > 0 {
+			cacheOpts.MaxBytes = cacheBytes
+		}
 		g.mainCache = NewCache(cacheOpts)
 	}
 
@@ -146,51 +163,108 @@ func GetGroup(name string) *Group {
 	return groups[name]
 }
 
+func (g *Group) waitForTopologyRetry(ctx context.Context, epoch uint64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if g.peers == nil {
+		return nil
+	}
+	const maxWait = 75 * time.Millisecond
+	timer := time.NewTimer(maxWait)
+	defer timer.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if g.peers.Epoch() != epoch {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		case <-timer.C:
+			// Avoid a tight retry loop when a remote owner has already observed a
+			// newer membership view than this requester.
+			return nil
+		}
+	}
+}
+
 // Get routes the key to its unique owner. Remote-owner results may be kept in
 // the optional near-cache for nearTTL.
 func (g *Group) Get(ctx context.Context, key string) (ByteView, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if atomic.LoadInt32(&g.closed) == 1 {
 		return ByteView{}, ErrGroupClosed
 	}
 	if key == "" {
 		return ByteView{}, ErrKeyRequired
 	}
-
 	if g.peers == nil {
 		return g.getLocal(ctx, key)
 	}
 
-	owner, peer, isSelf, ok := g.peers.PickOwner(key)
-	if !ok || owner == "" {
-		return ByteView{}, ErrNoOwner
-	}
-	if isSelf {
-		return g.getLocal(ctx, key)
-	}
-	if peer == nil {
-		return ByteView{}, fmt.Errorf("%w: owner=%s", ErrPeerUnavailable, owner)
-	}
-
-	nearKey := g.nearKey(g.peers.Epoch(), key)
-	if g.nearCache != nil {
-		if view, hit := g.nearCache.Get(ctx, nearKey); hit {
-			atomic.AddInt64(&g.stats.nearHits, 1)
-			return view, nil
+	for attempt := 0; attempt < 4; attempt++ {
+		owner, peer, isSelf, epoch, ok := g.peers.PickOwner(key)
+		if !ok || owner == "" {
+			return ByteView{}, ErrNoOwner
 		}
-		atomic.AddInt64(&g.stats.nearMisses, 1)
-	}
+		if isSelf {
+			view, err := g.getLocal(ctx, key)
+			if errors.Is(err, ErrTopologyChanged) || errors.Is(err, ErrNotOwner) {
+				continue
+			}
+			return view, err
+		}
+		if peer == nil {
+			return ByteView{}, fmt.Errorf("%w: owner=%s", ErrPeerUnavailable, owner)
+		}
 
-	bytes, err := peer.Get(ctx, g.name, key)
-	if err != nil {
-		atomic.AddInt64(&g.stats.peerMisses, 1)
-		return ByteView{}, fmt.Errorf("get %q from owner %s: %w", key, owner, err)
+		nearKey := g.nearKey(epoch, key)
+		if g.nearCache != nil {
+			if view, hit := g.nearCache.Get(ctx, nearKey); hit {
+				ownerNow, _, _, epochNow, okNow := g.peers.PickOwner(key)
+				if okNow && ownerNow == owner && epochNow == epoch {
+					atomic.AddInt64(&g.stats.nearHits, 1)
+					return view, nil
+				}
+				g.nearCache.Delete(nearKey)
+			}
+			atomic.AddInt64(&g.stats.nearMisses, 1)
+		}
+
+		bytes, err := peer.Get(ctx, g.name, key)
+		if err != nil {
+			atomic.AddInt64(&g.stats.peerMisses, 1)
+			if errors.Is(err, ErrNotOwner) || errors.Is(err, ErrTopologyChanged) {
+				if attempt == 3 {
+					return ByteView{}, ErrTopologyChanged
+				}
+				if waitErr := g.waitForTopologyRetry(ctx, epoch); waitErr != nil {
+					return ByteView{}, waitErr
+				}
+				continue
+			}
+			return ByteView{}, fmt.Errorf("get %q from owner %s: %w", key, owner, err)
+		}
+
+		ownerNow, _, isSelfNow, epochNow, okNow := g.peers.PickOwner(key)
+		if !okNow || ownerNow != owner || epochNow != epoch || isSelfNow {
+			continue
+		}
+
+		atomic.AddInt64(&g.stats.peerHits, 1)
+		view := ByteView{b: cloneBytes(bytes)}
+		if g.nearCache != nil {
+			g.nearCache.AddWithExpiration(nearKey, view, time.Now().Add(g.nearTTL))
+		}
+		return view, nil
 	}
-	atomic.AddInt64(&g.stats.peerHits, 1)
-	view := ByteView{b: cloneBytes(bytes)}
-	if g.nearCache != nil {
-		g.nearCache.AddWithExpiration(nearKey, view, time.Now().Add(g.nearTTL))
-	}
-	return view, nil
+	return ByteView{}, ErrTopologyChanged
 }
 
 // Set writes the key to its unique owner. After the owner acknowledges the
@@ -198,6 +272,9 @@ func (g *Group) Get(ctx context.Context, key string) (ByteView, error) {
 // best-effort basis. A failed invalidation does not roll back the owner write;
 // near-cache TTL is the fallback staleness bound.
 func (g *Group) Set(ctx context.Context, key string, value []byte) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if atomic.LoadInt32(&g.closed) == 1 {
 		return ErrGroupClosed
 	}
@@ -209,19 +286,27 @@ func (g *Group) Set(ctx context.Context, key string, value []byte) error {
 	}
 
 	owner := ""
-	if g.peers == nil {
-		if err := g.setLocal(key, value); err != nil {
-			return err
+	var stableEpoch uint64
+	for attempt := 0; attempt < 4; attempt++ {
+		if g.peers == nil {
+			if err := g.setLocal(key, value); err != nil {
+				return err
+			}
+			break
 		}
-	} else {
+
 		var peer Peer
 		var isSelf, ok bool
-		owner, peer, isSelf, ok = g.peers.PickOwner(key)
+		var epoch uint64
+		owner, peer, isSelf, epoch, ok = g.peers.PickOwner(key)
 		if !ok || owner == "" {
 			return ErrNoOwner
 		}
 		if isSelf {
 			if err := g.setLocal(key, value); err != nil {
+				if errors.Is(err, ErrTopologyChanged) || errors.Is(err, ErrNotOwner) {
+					continue
+				}
 				return err
 			}
 		} else {
@@ -229,8 +314,26 @@ func (g *Group) Set(ctx context.Context, key string, value []byte) error {
 				return fmt.Errorf("%w: owner=%s", ErrPeerUnavailable, owner)
 			}
 			if err := peer.Set(ctx, g.name, key, value); err != nil {
+				if errors.Is(err, ErrNotOwner) || errors.Is(err, ErrTopologyChanged) {
+					if attempt == 3 {
+						return ErrTopologyChanged
+					}
+					if waitErr := g.waitForTopologyRetry(ctx, epoch); waitErr != nil {
+						return waitErr
+					}
+					continue
+				}
 				return fmt.Errorf("set %q on owner %s: %w", key, owner, err)
 			}
+		}
+
+		ownerNow, _, _, epochNow, okNow := g.peers.PickOwner(key)
+		if okNow && ownerNow == owner && epochNow == epoch {
+			stableEpoch = epoch
+			break
+		}
+		if attempt == 3 {
+			return ErrTopologyChanged
 		}
 	}
 
@@ -238,12 +341,10 @@ func (g *Group) Set(ctx context.Context, key string, value []byte) error {
 	g.invalidateLocalCopies(key)
 	g.invalidatePeerCopies(ctx, key, owner)
 
-	// The writer may immediately reuse the value locally without another RPC.
-	// This is still a non-authoritative near-cache copy and expires normally.
 	if g.peers != nil && g.nearCache != nil && owner != "" {
-		ownerNow, _, isSelfNow, ok := g.peers.PickOwner(key)
-		if ok && ownerNow == owner && !isSelfNow {
-			g.nearCache.AddWithExpiration(g.nearKey(g.peers.Epoch(), key), ByteView{b: cloneBytes(value)}, time.Now().Add(g.nearTTL))
+		ownerNow, _, isSelfNow, epochNow, ok := g.peers.PickOwner(key)
+		if ok && ownerNow == owner && epochNow == stableEpoch && !isSelfNow {
+			g.nearCache.AddWithExpiration(g.nearKey(stableEpoch, key), ByteView{b: cloneBytes(value)}, time.Now().Add(g.nearTTL))
 		}
 	}
 	return nil
@@ -252,6 +353,9 @@ func (g *Group) Set(ctx context.Context, key string, value []byte) error {
 // Delete evicts the key from the owner and then best-effort invalidates cached
 // copies on other nodes. It does not mutate the external source of truth.
 func (g *Group) Delete(ctx context.Context, key string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if atomic.LoadInt32(&g.closed) == 1 {
 		return ErrGroupClosed
 	}
@@ -260,12 +364,16 @@ func (g *Group) Delete(ctx context.Context, key string) error {
 	}
 
 	owner := ""
-	if g.peers == nil {
-		g.deleteLocal(key)
-	} else {
+	for attempt := 0; attempt < 4; attempt++ {
+		if g.peers == nil {
+			g.deleteLocal(key)
+			break
+		}
+
 		var peer Peer
 		var isSelf, ok bool
-		owner, peer, isSelf, ok = g.peers.PickOwner(key)
+		var epoch uint64
+		owner, peer, isSelf, epoch, ok = g.peers.PickOwner(key)
 		if !ok || owner == "" {
 			return ErrNoOwner
 		}
@@ -276,8 +384,25 @@ func (g *Group) Delete(ctx context.Context, key string) error {
 				return fmt.Errorf("%w: owner=%s", ErrPeerUnavailable, owner)
 			}
 			if _, err := peer.Delete(ctx, g.name, key); err != nil {
+				if errors.Is(err, ErrNotOwner) || errors.Is(err, ErrTopologyChanged) {
+					if attempt == 3 {
+						return ErrTopologyChanged
+					}
+					if waitErr := g.waitForTopologyRetry(ctx, epoch); waitErr != nil {
+						return waitErr
+					}
+					continue
+				}
 				return fmt.Errorf("delete %q on owner %s: %w", key, owner, err)
 			}
+		}
+
+		ownerNow, _, _, epochNow, okNow := g.peers.PickOwner(key)
+		if okNow && ownerNow == owner && epochNow == epoch {
+			break
+		}
+		if attempt == 3 {
+			return ErrTopologyChanged
 		}
 	}
 
@@ -293,6 +418,15 @@ func (g *Group) getLocal(ctx context.Context, key string) (ByteView, error) {
 	if atomic.LoadInt32(&g.closed) == 1 {
 		return ByteView{}, ErrGroupClosed
 	}
+
+	epoch, err := g.prepareLocalOwner(key)
+	if err != nil {
+		return ByteView{}, err
+	}
+
+	state := g.acquireKeyState(key)
+	defer g.releaseKeyState(key, state)
+
 	if view, ok := g.mainCache.Get(ctx, key); ok {
 		atomic.AddInt64(&g.stats.localHits, 1)
 		return view, nil
@@ -304,11 +438,14 @@ func (g *Group) getLocal(ctx context.Context, key string) (ByteView, error) {
 	}
 
 	loaded, err := g.loader.Do(key, func() (interface{}, error) {
-		// Recheck after winning singleflight; another request may have populated
-		// the owner cache between the optimistic miss and this call.
+		state.mu.Lock()
 		if view, ok := g.mainCache.Get(ctx, key); ok {
+			state.mu.Unlock()
 			return view, nil
 		}
+		startGeneration := state.generation
+		state.mu.Unlock()
+
 		start := time.Now()
 		atomic.AddInt64(&g.stats.sourceLoads, 1)
 		bytes, loadErr := g.getter.Get(ctx, key)
@@ -317,11 +454,31 @@ func (g *Group) getLocal(ctx context.Context, key string) (ByteView, error) {
 			atomic.AddInt64(&g.stats.sourceErrors, 1)
 			return nil, loadErr
 		}
+
+		if g.peers != nil {
+			_, _, isSelfNow, epochNow, ok := g.peers.PickOwner(key)
+			if !ok || !isSelfNow || epochNow != epoch {
+				return nil, ErrTopologyChanged
+			}
+		}
+
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		if state.generation != startGeneration {
+			if view, ok := g.mainCache.Get(ctx, key); ok {
+				return view, nil
+			}
+			return nil, ErrCacheMiss
+		}
+
 		view := ByteView{b: cloneBytes(bytes)}
 		g.addOwnerValue(key, view)
 		return view, nil
 	})
 	if err != nil {
+		if errors.Is(err, ErrCacheMiss) || errors.Is(err, ErrTopologyChanged) || errors.Is(err, ErrNotOwner) {
+			return ByteView{}, err
+		}
 		return ByteView{}, fmt.Errorf("load %q from source: %w", key, err)
 	}
 	return loaded.(ByteView), nil
@@ -331,7 +488,17 @@ func (g *Group) setLocal(key string, value []byte) error {
 	if atomic.LoadInt32(&g.closed) == 1 {
 		return ErrGroupClosed
 	}
+	if _, err := g.prepareLocalOwner(key); err != nil && g.peers != nil {
+		return err
+	}
+	state := g.acquireKeyState(key)
+	defer g.releaseKeyState(key, state)
+
+	state.mu.Lock()
+	state.generation++
 	g.addOwnerValue(key, ByteView{b: cloneBytes(value)})
+	state.mu.Unlock()
+
 	g.invalidateNearKey(key)
 	return nil
 }
@@ -344,8 +511,25 @@ func (g *Group) addOwnerValue(key string, view ByteView) {
 	}
 }
 
+func (g *Group) deleteOwnerLocal(key string) (bool, error) {
+	if atomic.LoadInt32(&g.closed) == 1 {
+		return false, ErrGroupClosed
+	}
+	if _, err := g.prepareLocalOwner(key); err != nil && g.peers != nil {
+		return false, err
+	}
+	return g.deleteLocal(key), nil
+}
+
 func (g *Group) deleteLocal(key string) bool {
+	state := g.acquireKeyState(key)
+	defer g.releaseKeyState(key, state)
+
+	state.mu.Lock()
+	state.generation++
 	removed := g.mainCache.Delete(key)
+	state.mu.Unlock()
+
 	g.invalidateNearKey(key)
 	return removed
 }
@@ -362,12 +546,57 @@ func (g *Group) invalidateNearKey(key string) {
 func (g *Group) invalidateLocalCopies(key string) {
 	// mainCache may contain a stale copy from a previous ownership epoch.
 	if g.peers != nil {
-		owner, _, isSelf, ok := g.peers.PickOwner(key)
+		owner, _, isSelf, _, ok := g.peers.PickOwner(key)
 		if ok && owner != "" && !isSelf {
 			g.mainCache.Delete(key)
 		}
 	}
 	g.invalidateNearKey(key)
+}
+
+func (g *Group) prepareLocalOwner(key string) (uint64, error) {
+	if g.peers == nil {
+		return 0, nil
+	}
+	owner, _, isSelf, epoch, ok := g.peers.PickOwner(key)
+	if !ok || owner == "" {
+		return 0, ErrNoOwner
+	}
+	if !isSelf {
+		return 0, fmt.Errorf("%w: owner=%s", ErrNotOwner, owner)
+	}
+	g.ownerEpochMu.Lock()
+	if g.ownerEpoch == 0 {
+		g.ownerEpoch = epoch
+	} else if g.ownerEpoch != epoch {
+		// Membership changes can move ownership away and later back. Old
+		// owner-cache entries must never become authoritative again.
+		g.mainCache.Clear()
+		g.ownerEpoch = epoch
+	}
+	g.ownerEpochMu.Unlock()
+	return epoch, nil
+}
+
+func (g *Group) acquireKeyState(key string) *keyMutationState {
+	g.keyStatesMu.Lock()
+	state := g.keyStates[key]
+	if state == nil {
+		state = &keyMutationState{}
+		g.keyStates[key] = state
+	}
+	state.refs++
+	g.keyStatesMu.Unlock()
+	return state
+}
+
+func (g *Group) releaseKeyState(key string, state *keyMutationState) {
+	g.keyStatesMu.Lock()
+	state.refs--
+	if state.refs == 0 && g.keyStates[key] == state {
+		delete(g.keyStates, key)
+	}
+	g.keyStatesMu.Unlock()
 }
 
 func (g *Group) invalidatePeerCopies(ctx context.Context, key, owner string) {

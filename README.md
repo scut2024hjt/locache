@@ -15,6 +15,37 @@ Locache 不是数据库，也不把缓存当作业务数据的 Source of Truth�
 
 对于余额、库存扣减、订单状态等要求严格一致的核心状态，缓存只能作为加速层，权威读写仍应由对应业务存储承担。
 
+### 与普通本地缓存相比，核心收益是什么
+
+Locache 的核心收益不是“整个集群绝不重复缓存数据”。开启 Near Cache 后，一个热点 Key 的确可能在多个节点保留短 TTL 副本。
+
+更准确的区别是：**同一个 Key 在集群中只有一个 Owner，所有节点的冷 miss / 回源请求最终汇聚到这个 Owner，再由 Owner 处的 singleflight 协调一次 Source 加载。**
+
+普通进程内缓存中，N 个业务实例首次同时访问同一个冷 Key 时，可能各自 miss、各自访问数据库：
+
+```text
+A local miss ──> DB
+B local miss ──> DB
+C local miss ──> DB
+```
+
+Locache 中则是：
+
+```text
+A ─┐
+B ─┼──> unique Owner ──> singleflight ──> Source once
+C ─┘
+```
+
+因此它相对普通本地缓存主要增加了：
+
+- **集群级唯一回源点**：同 Key 的并发 miss 在 Owner 汇聚，降低多实例同时打穿下游的风险；
+- **统一 Key ownership**：一致性哈希决定由哪个节点承担正式缓存和回源职责；
+- **跨节点复用缓存**：请求落到非 Owner 时可以直接通过 gRPC 利用 Owner 已有缓存；
+- **动态成员管理**：实例上下线后通过 etcd 更新 membership 并重新分环。
+
+对于非热点 Key，Owner 分片也能减少“每个实例都各存一份”的重复；但 Near Cache 会对热点 Key 有选择地增加副本。因此“聚合多机内存”是收益之一，**不是绝对不复制**，而“集群级统一 Owner + 统一回源”才是更本质的设计。
+
 ## 核心模型
 
 ```text
@@ -169,7 +200,12 @@ Get(prefix) -> snapshot + revision
 - Server 停止时撤销 lease；
 - membership 包含 self，但只有远端成员才建立 gRPC Client。
 
-membership 变化时 epoch 递增；Near Cache key 带 epoch，因此旧拓扑下的副本不会在新拓扑中继续命中。
+membership 变化时 epoch 递增。当前实现同时做两层保护：
+
+- Near Cache key 带 epoch，旧拓扑下的 requester 副本不会在新拓扑中继续命中；
+- Owner 本地缓存记录当前 membership epoch，检测到 epoch 变化时保守清空 Owner Cache，避免某节点失去 ownership 后再次成为 Owner 时重新命中上一次 ownership 周期留下的旧值。
+
+远程 Get 在返回后会重新校验 `Owner + epoch`；如果请求期间拓扑发生变化，则丢弃旧拓扑结果并重新路由。若旧 Owner 已先观察到新拓扑并拒绝请求，服务端会把该错误映射为可识别的拓扑变化，调用方在短暂等待 membership 收敛后重新选择 Owner。旧结果不会写入新 epoch 的 Near Cache。
 
 ## singleflight：在 Owner 合并回源
 
@@ -181,7 +217,9 @@ Node C ─┼──> Owner B ──> singleflight ──> Getter once
 Node D ─┘
 ```
 
-多个入口节点对同一热点 Key 的并发请求最终汇聚到同一个 Owner，并共享一次 Source 查询。
+多个入口节点对同一热点 Key 的并发请求最终汇聚到同一个 Owner，并共享一次 Source 查询。这是 Locache 相比“每个实例各自维护一份本地缓存”最核心的差异之一。
+
+Owner 的 read-through 写回还带有 per-key mutation generation：如果慢 Getter 在执行期间发生了 `Set/Delete`，旧回源结果不会覆盖新值，也不会把已失效的缓存条目重新写回。
 
 如果 Group 没有 Getter，Owner miss 直接返回 `ErrCacheMiss`，此时 Locache 就是普通的显式 Get/Set/Delete 分布式缓存。
 
@@ -197,7 +235,7 @@ hash(key)
    └─ shard N -> LRU + mutex
 ```
 
-不同 Key 分散到独立 shard，降低全局锁竞争；每个 shard 支持容量淘汰和 TTL 清理。
+不同 Key 分散到独立 shard，降低全局锁竞争；每个 shard 支持容量淘汰和 TTL 清理。对于非常小的总容量配置，会自动减少 shard 数，避免把总预算切成无法容纳任何条目的碎片。
 
 ## API 示例
 
@@ -274,7 +312,7 @@ Pick Owner
   -> best-effort evict copies on other nodes
 ```
 
-远端 Owner 在 membership 收敛前暂时不可达时，请求会返回错误；当前不会让非 Owner 擅自变成 Owner，因为那会破坏明确的 ownership 语义。
+远端 Owner 因拓扑视图更新而拒绝请求时，调用方会进行有界重路由重试；若 Owner 真正不可达且 etcd membership 尚未收敛，重试耗尽后仍会返回错误。系统不会让非 Owner 擅自接管，因为那会破坏明确的 ownership 语义。
 
 ## 项目结构
 
@@ -318,6 +356,7 @@ CI 执行 `gofmt`、`go vet`、普通测试和 race test。
 - Locache 是缓存，不是持久化 KV；
 - `Set/Delete` 只操作缓存，Source 更新仍由业务负责；
 - Near Cache 开启时允许短暂陈旧，主动失效失败由 TTL 兜底；
+- 如果 Source of Truth 在 Locache 之外被修改，业务需要同步调用 `Set/Delete` 或为 Owner Cache 配置 TTL；`expiration=0` 本身不会自动感知外部数据变化；
 - 写操作需要向其他节点发送失效请求，当前适合读多写少而非高写入吞吐场景；
 - 节点变化时不迁移缓存数据；
 - 当前没有副本 Owner、quorum、Raft 或跨机房一致性协议；

@@ -19,6 +19,13 @@ func newShardedLRU(opts Options) *shardedLRU {
 		count = 16
 	}
 	count = nextPowerOfTwo(count)
+	// Very small total budgets should not be split into many unusably tiny
+	// shards. Keep at least 1 KiB of budget per shard when a limit is set.
+	if opts.MaxBytes > 0 {
+		for count > 1 && opts.MaxBytes/int64(count) < 1024 {
+			count >>= 1
+		}
+	}
 
 	cleanupInterval := opts.CleanupInterval
 	if cleanupInterval <= 0 {
@@ -42,9 +49,6 @@ func newShardedLRU(opts Options) *shardedLRU {
 			shardOpts.MaxBytes = base
 			if int64(i) < remainder {
 				shardOpts.MaxBytes++
-			}
-			if shardOpts.MaxBytes == 0 {
-				shardOpts.MaxBytes = 1
 			}
 		}
 		// The sharded store owns one cleanup ticker for all shards; individual
