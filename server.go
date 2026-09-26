@@ -2,14 +2,13 @@ package locache
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
 	"time"
 
-	"crypto/tls"
-
-	"github.com/sirupsen/logrus"
 	pb "github.com/scut2024hjt/locache/pb"
 	"github.com/scut2024hjt/locache/registry"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -19,53 +18,63 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 )
 
-// Server 定义缓存服务器
 type Server struct {
 	pb.UnimplementedLocacheServer
-	addr       string           // 服务地址
-	svcName    string           // 服务名称
-	groups     *sync.Map        // 缓存组
-	grpcServer *grpc.Server     // gRPC服务器
-	etcdCli    *clientv3.Client // etcd客户端
-	stopCh     chan error       // 停止信号
-	opts       *ServerOptions   // 服务器选项
+	listenAddr    string
+	advertiseAddr string
+	svcName       string
+	grpcServer    *grpc.Server
+	etcdCli       *clientv3.Client
+	opts          ServerOptions
+	ctx           context.Context
+	cancel        context.CancelFunc
+	mu            sync.Mutex
+	registration  *registry.Registration
+	listener      net.Listener
+	stopOnce      sync.Once
 }
 
-// ServerOptions 服务器配置选项
 type ServerOptions struct {
-	EtcdEndpoints []string      // etcd端点
-	DialTimeout   time.Duration // 连接超时
-	MaxMsgSize    int           // 最大消息大小
-	TLS           bool          // 是否启用TLS
-	CertFile      string        // 证书文件
-	KeyFile       string        // 密钥文件
+	EtcdEndpoints []string
+	DialTimeout   time.Duration
+	LeaseTTL      int64
+	MaxMsgSize    int
+	TLS           bool
+	CertFile      string
+	KeyFile       string
+	AdvertiseAddr string
 }
 
-// DefaultServerOptions 默认配置
-var DefaultServerOptions = &ServerOptions{
+var DefaultServerOptions = ServerOptions{
 	EtcdEndpoints: []string{"localhost:2379"},
 	DialTimeout:   5 * time.Second,
-	MaxMsgSize:    4 << 20, // 4MB
+	LeaseTTL:      10,
+	MaxMsgSize:    4 << 20,
 }
 
-// ServerOption 定义选项函数类型
 type ServerOption func(*ServerOptions)
 
-// WithEtcdEndpoints 设置etcd端点
 func WithEtcdEndpoints(endpoints []string) ServerOption {
-	return func(o *ServerOptions) {
-		o.EtcdEndpoints = endpoints
-	}
+	return func(o *ServerOptions) { o.EtcdEndpoints = append([]string(nil), endpoints...) }
 }
-
-// WithDialTimeout 设置连接超时
 func WithDialTimeout(timeout time.Duration) ServerOption {
 	return func(o *ServerOptions) {
-		o.DialTimeout = timeout
+		if timeout > 0 {
+			o.DialTimeout = timeout
+		}
 	}
 }
+func WithLeaseTTL(seconds int64) ServerOption {
+	return func(o *ServerOptions) {
+		if seconds > 0 {
+			o.LeaseTTL = seconds
+		}
+	}
+}
+func WithAdvertiseAddress(addr string) ServerOption {
+	return func(o *ServerOptions) { o.AdvertiseAddr = addr }
+}
 
-// WithTLS 设置TLS配置
 func WithTLS(certFile, keyFile string) ServerOption {
 	return func(o *ServerOptions) {
 		o.TLS = true
@@ -74,139 +83,153 @@ func WithTLS(certFile, keyFile string) ServerOption {
 	}
 }
 
-// NewServer 创建新的服务器实例
 func NewServer(addr, svcName string, opts ...ServerOption) (*Server, error) {
 	options := DefaultServerOptions
+	options.EtcdEndpoints = append([]string(nil), DefaultServerOptions.EtcdEndpoints...)
 	for _, opt := range opts {
-		opt(options)
+		opt(&options)
 	}
-
-	// 创建etcd客户端
-	etcdCli, err := clientv3.New(clientv3.Config{
-		Endpoints:   options.EtcdEndpoints,
-		DialTimeout: options.DialTimeout,
-	})
+	if svcName == "" {
+		svcName = defaultSvcName
+	}
+	advertiseSource := addr
+	if options.AdvertiseAddr != "" {
+		advertiseSource = options.AdvertiseAddr
+	}
+	advertiseAddr, err := registry.NormalizeAddress(advertiseSource)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create etcd client: %v", err)
+		return nil, err
 	}
 
-	// 创建gRPC服务器
-	var serverOpts []grpc.ServerOption
-	serverOpts = append(serverOpts, grpc.MaxRecvMsgSize(options.MaxMsgSize))
+	etcdCli, err := clientv3.New(clientv3.Config{Endpoints: options.EtcdEndpoints, DialTimeout: options.DialTimeout})
+	if err != nil {
+		return nil, fmt.Errorf("create etcd client: %w", err)
+	}
 
+	serverOpts := []grpc.ServerOption{
+		grpc.MaxRecvMsgSize(options.MaxMsgSize),
+		grpc.MaxSendMsgSize(options.MaxMsgSize),
+	}
 	if options.TLS {
 		creds, err := loadTLSCredentials(options.CertFile, options.KeyFile)
 		if err != nil {
-			return nil, fmt.Errorf("failed to load TLS credentials: %v", err)
+			_ = etcdCli.Close()
+			return nil, fmt.Errorf("load TLS credentials: %w", err)
 		}
 		serverOpts = append(serverOpts, grpc.Creds(creds))
 	}
 
-	srv := &Server{
-		addr:       addr,
-		svcName:    svcName,
-		groups:     &sync.Map{},
-		grpcServer: grpc.NewServer(serverOpts...),
-		etcdCli:    etcdCli,
-		stopCh:     make(chan error),
-		opts:       options,
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Server{
+		listenAddr:    addr,
+		advertiseAddr: advertiseAddr,
+		svcName:       svcName,
+		grpcServer:    grpc.NewServer(serverOpts...),
+		etcdCli:       etcdCli,
+		opts:          options,
+		ctx:           ctx,
+		cancel:        cancel,
 	}
-
-	// 注册服务
-	pb.RegisterLocacheServer(srv.grpcServer, srv)
-
-	// 注册健康检查服务
+	pb.RegisterLocacheServer(s.grpcServer, s)
 	healthServer := health.NewServer()
-	healthpb.RegisterHealthServer(srv.grpcServer, healthServer)
+	healthpb.RegisterHealthServer(s.grpcServer, healthServer)
 	healthServer.SetServingStatus(svcName, healthpb.HealthCheckResponse_SERVING)
-
-	return srv, nil
+	return s, nil
 }
 
-// Start 启动服务器
+// Address is the canonical address registered in etcd. Use the same value when
+// constructing the local ClientPicker so every node names itself consistently.
+func (s *Server) Address() string { return s.advertiseAddr }
+
 func (s *Server) Start() error {
-	// 启动gRPC服务器
-	lis, err := net.Listen("tcp", s.addr)
+	lis, err := net.Listen("tcp", s.listenAddr)
 	if err != nil {
-		return fmt.Errorf("failed to listen: %v", err)
+		return fmt.Errorf("listen on %s: %w", s.listenAddr, err)
 	}
 
-	// 注册到etcd
-	stopCh := make(chan error)
-	go func() {
-		if err := registry.Register(s.svcName, s.addr, stopCh); err != nil {
-			logrus.Errorf("failed to register service: %v", err)
-			close(stopCh)
-			return
-		}
+	reg, err := registry.Register(s.ctx, s.etcdCli, s.svcName, s.advertiseAddr, s.opts.LeaseTTL)
+	if err != nil {
+		_ = lis.Close()
+		return fmt.Errorf("register locache service: %w", err)
+	}
+
+	s.mu.Lock()
+	s.registration = reg
+	s.listener = lis
+	s.mu.Unlock()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = reg.Close(ctx)
+		cancel()
 	}()
 
-	logrus.Infof("Server starting at %s", s.addr)
-	return s.grpcServer.Serve(lis)
-}
-
-// Stop 停止服务器
-func (s *Server) Stop() {
-	close(s.stopCh)
-	s.grpcServer.GracefulStop()
-	if s.etcdCli != nil {
-		s.etcdCli.Close()
+	err = s.grpcServer.Serve(lis)
+	if err != nil && !errors.Is(err, grpc.ErrServerStopped) && s.ctx.Err() == nil {
+		return err
 	}
+	return nil
 }
 
-// Get 实现Cache服务的Get方法
+func (s *Server) Stop() {
+	s.stopOnce.Do(func() {
+		s.cancel()
+		s.mu.Lock()
+		reg := s.registration
+		s.mu.Unlock()
+		if reg != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_ = reg.Close(ctx)
+			cancel()
+		}
+		s.grpcServer.GracefulStop()
+		if s.etcdCli != nil {
+			_ = s.etcdCli.Close()
+		}
+	})
+}
+
+// Get is deliberately local-only. The caller already selected this node as the
+// owner, so peer requests cannot recursively re-enter distributed routing.
 func (s *Server) Get(ctx context.Context, req *pb.Request) (*pb.ResponseForGet, error) {
 	group := GetGroup(req.Group)
 	if group == nil {
 		return nil, fmt.Errorf("group %s not found", req.Group)
 	}
-
-	view, err := group.Get(ctx, req.Key)
+	view, err := group.getLocal(ctx, req.Key)
 	if err != nil {
 		return nil, err
 	}
-
-	return &pb.ResponseForGet{Value: view.ByteSLice()}, nil
+	return &pb.ResponseForGet{Value: view.ByteSlice()}, nil
 }
 
-// Set 实现Cache服务的Set方法
-func (s *Server) Set(ctx context.Context, req *pb.Request) (*pb.ResponseForGet, error) {
+// Set is local-only. Distributed routing happened on the caller before this RPC.
+func (s *Server) Set(_ context.Context, req *pb.Request) (*pb.ResponseForGet, error) {
 	group := GetGroup(req.Group)
 	if group == nil {
 		return nil, fmt.Errorf("group %s not found", req.Group)
 	}
-
-	// 从 context 中获取标记，如果没有则创建新的 context
-	fromPeer := ctx.Value("from_peer")
-	if fromPeer == nil {
-		ctx = context.WithValue(ctx, "from_peer", true)
-	}
-
-	if err := group.Set(ctx, req.Key, req.Value); err != nil {
+	if err := group.setLocal(req.Key, req.Value); err != nil {
 		return nil, err
 	}
-
 	return &pb.ResponseForGet{Value: req.Value}, nil
 }
 
-// Delete 实现Cache服务的Delete方法
-func (s *Server) Delete(ctx context.Context, req *pb.Request) (*pb.ResponseForDelete, error) {
+// Delete is an idempotent local eviction. Public Group.Delete uses it for the
+// owner mutation, and mutation invalidation reuses it on non-owner peers to
+// drop near-cache or stale previous-owner copies without recursive routing.
+func (s *Server) Delete(_ context.Context, req *pb.Request) (*pb.ResponseForDelete, error) {
 	group := GetGroup(req.Group)
 	if group == nil {
 		return nil, fmt.Errorf("group %s not found", req.Group)
 	}
-
-	err := group.Delete(ctx, req.Key)
-	return &pb.ResponseForDelete{Value: err == nil}, err
+	removed := group.deleteLocal(req.Key)
+	return &pb.ResponseForDelete{Value: removed}, nil
 }
 
-// loadTLSCredentials 加载TLS证书
 func loadTLSCredentials(certFile, keyFile string) (credentials.TransportCredentials, error) {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		return nil, err
 	}
-	return credentials.NewTLS(&tls.Config{
-		Certificates: []tls.Certificate{cert},
-	}), nil
+	return credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}), nil
 }

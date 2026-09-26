@@ -2,12 +2,12 @@ package store
 
 import "time"
 
-// Value 缓存值接口
+// Value is the minimal value contract required by the cache. Len is used for
+// byte-based capacity accounting.
 type Value interface {
-	Len() int // 返回数据大小
+	Len() int
 }
 
-// Store 缓存接口
 type Store interface {
 	Get(key string) (Value, bool)
 	Set(key string, value Value) error
@@ -18,43 +18,38 @@ type Store interface {
 	Close()
 }
 
-// CacheType 缓存类型
 type CacheType string
 
 const (
-	LRU  CacheType = "lru"
-	LRU2 CacheType = "lru2"
+	// LRU is a single-lock LRU, mainly useful for small caches and tests.
+	LRU CacheType = "lru"
+	// ShardedLRU partitions keys across independent LRU shards so unrelated
+	// keys do not contend on one global lock.
+	ShardedLRU CacheType = "sharded-lru"
 )
 
-// Options 通用缓存配置选项
 type Options struct {
-	MaxBytes        int64  // 最大的缓存字节数（用于 lru）
-	BucketCount     uint16 // 缓存的桶数量（用于 lru-2）
-	CapPerBucket    uint16 // 每个桶的容量（用于 lru-2）
-	Level2Cap       uint16 // lru-2 中二级缓存的容量（用于 lru-2）
+	MaxBytes        int64
+	ShardCount      int
 	CleanupInterval time.Duration
 	OnEvicted       func(key string, value Value)
 }
 
 func NewOptions() Options {
 	return Options{
-		MaxBytes:        8192,
-		BucketCount:     16,
-		CapPerBucket:    512,
-		Level2Cap:       256,
+		MaxBytes:        8 << 20,
+		ShardCount:      16,
 		CleanupInterval: time.Minute,
-		OnEvicted:       nil,
 	}
 }
 
-// NewStore 创建缓存存储实例
 func NewStore(cacheType CacheType, opts Options) Store {
 	switch cacheType {
-	case LRU2:
-		return newLRU2Cache(opts)
 	case LRU:
 		return newLRUCache(opts)
+	case ShardedLRU:
+		return newShardedLRU(opts)
 	default:
-		return newLRUCache(opts)
+		return newShardedLRU(opts)
 	}
 }

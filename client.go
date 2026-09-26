@@ -5,100 +5,78 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/sirupsen/logrus"
 	pb "github.com/scut2024hjt/locache/pb"
-	clientv3 "go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
 type Client struct {
-	addr    string
-	svcName string
-	etcdCli *clientv3.Client
-	conn    *grpc.ClientConn
-	grpcCli pb.LocacheClient
+	addr       string
+	rpcTimeout time.Duration
+	conn       *grpc.ClientConn
+	grpcCli    pb.LocacheClient
 }
 
 var _ Peer = (*Client)(nil)
 
-func NewClient(addr string, svcName string, etcdCli *clientv3.Client) (*Client, error) {
-	var err error
-	if etcdCli == nil {
-		etcdCli, err = clientv3.New(clientv3.Config{
-			Endpoints:   []string{"localhost:2379"},
-			DialTimeout: 5 * time.Second,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to create etcd client: %v", err)
-		}
+func NewClient(addr string, rpcTimeout time.Duration) (*Client, error) {
+	if rpcTimeout <= 0 {
+		rpcTimeout = 3 * time.Second
 	}
-
-	conn, err := grpc.Dial(addr,
+	conn, err := grpc.NewClient(
+		addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
-		grpc.WithTimeout(10*time.Second),
 		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to dial server: %v", err)
+		return nil, fmt.Errorf("create grpc client for %s: %w", addr, err)
 	}
-
-	grpcClient := pb.NewLocacheClient(conn)
-
-	client := &Client{
-		addr:    addr,
-		svcName: svcName,
-		etcdCli: etcdCli,
-		conn:    conn,
-		grpcCli: grpcClient,
-	}
-
-	return client, nil
+	return &Client{
+		addr:       addr,
+		rpcTimeout: rpcTimeout,
+		conn:       conn,
+		grpcCli:    pb.NewLocacheClient(conn),
+	}, nil
 }
 
-func (c *Client) Get(group, key string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	resp, err := c.grpcCli.Get(ctx, &pb.Request{
-		Group: group,
-		Key:   key,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to get value from locache: %v", err)
+func (c *Client) callContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-
-	return resp.GetValue(), nil
+	if _, hasDeadline := ctx.Deadline(); hasDeadline {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, c.rpcTimeout)
 }
 
-func (c *Client) Delete(group, key string) (bool, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+func (c *Client) Get(ctx context.Context, group, key string) ([]byte, error) {
+	callCtx, cancel := c.callContext(ctx)
 	defer cancel()
-
-	resp, err := c.grpcCli.Delete(ctx, &pb.Request{
-		Group: group,
-		Key:   key,
-	})
+	resp, err := c.grpcCli.Get(callCtx, &pb.Request{Group: group, Key: key})
 	if err != nil {
-		return false, fmt.Errorf("failed to delete value from locache: %v", err)
+		return nil, fmt.Errorf("grpc get from %s: %w", c.addr, err)
 	}
-
 	return resp.GetValue(), nil
 }
 
 func (c *Client) Set(ctx context.Context, group, key string, value []byte) error {
-	resp, err := c.grpcCli.Set(ctx, &pb.Request{
-		Group: group,
-		Key:   key,
-		Value: value,
-	})
+	callCtx, cancel := c.callContext(ctx)
+	defer cancel()
+	_, err := c.grpcCli.Set(callCtx, &pb.Request{Group: group, Key: key, Value: value})
 	if err != nil {
-		return fmt.Errorf("failed to set value to locache: %v", err)
+		return fmt.Errorf("grpc set on %s: %w", c.addr, err)
 	}
-	logrus.Infof("grpc set request resp: %+v", resp)
-
 	return nil
+}
+
+func (c *Client) Delete(ctx context.Context, group, key string) (bool, error) {
+	callCtx, cancel := c.callContext(ctx)
+	defer cancel()
+	resp, err := c.grpcCli.Delete(callCtx, &pb.Request{Group: group, Key: key})
+	if err != nil {
+		return false, fmt.Errorf("grpc delete on %s: %w", c.addr, err)
+	}
+	return resp.GetValue(), nil
 }
 
 func (c *Client) Close() error {

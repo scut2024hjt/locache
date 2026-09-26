@@ -1,21 +1,16 @@
 package locache
 
-// ByteView 只读的字节视图，用于缓存数据
-type ByteView struct {
-	b []byte
-}
+// ByteView is an immutable view of cached bytes. ByteSlice returns a defensive
+// copy so callers cannot mutate the value stored in cache.
+type ByteView struct{ b []byte }
 
-func (b ByteView) Len() int {
-	return len(b.b)
-}
+func (b ByteView) Len() int          { return len(b.b) }
+func (b ByteView) String() string    { return string(b.b) }
+func (b ByteView) ByteSlice() []byte { return cloneBytes(b.b) }
 
-func (b ByteView) ByteSLice() []byte {
-	return cloneBytes(b.b)
-}
-
-func (b ByteView) String() string {
-	return string(b.b)
-}
+// ByteSLice is kept for source compatibility with older versions.
+// Deprecated: use ByteSlice.
+func (b ByteView) ByteSLice() []byte { return b.ByteSlice() }
 
 func cloneBytes(b []byte) []byte {
 	c := make([]byte, len(b))

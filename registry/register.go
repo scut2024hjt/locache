@@ -4,88 +4,140 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
-// Config 定义etcd客户端配置
 type Config struct {
-	Endpoints   []string      // 集群地址
-	DialTimeout time.Duration // 连接超时时间
+	Endpoints   []string
+	DialTimeout time.Duration
+	LeaseTTL    int64
 }
 
-// DefaultConfig 提供默认配置
-var DefaultConfig = &Config{
+var DefaultConfig = Config{
 	Endpoints:   []string{"localhost:2379"},
 	DialTimeout: 5 * time.Second,
+	LeaseTTL:    10,
 }
 
-// Register 注册服务到etcd
-func Register(svcName, addr string, stopCh <-chan error) error {
-	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   DefaultConfig.Endpoints,
-		DialTimeout: DefaultConfig.DialTimeout,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create etcd client: %v", err)
+func ServicePrefix(svcName string) string {
+	return fmt.Sprintf("/services/%s/", svcName)
+}
+
+func ServiceKey(svcName, addr string) string {
+	return ServicePrefix(svcName) + addr
+}
+
+// Registration owns one etcd lease. The etcd client itself is owned by the
+// caller and is intentionally not closed here.
+type Registration struct {
+	cli     *clientv3.Client
+	leaseID clientv3.LeaseID
+	cancel  context.CancelFunc
+	done    chan struct{}
+	once    sync.Once
+}
+
+func Register(parent context.Context, cli *clientv3.Client, svcName, addr string, ttl int64) (*Registration, error) {
+	if cli == nil {
+		return nil, fmt.Errorf("nil etcd client")
+	}
+	if ttl <= 0 {
+		ttl = DefaultConfig.LeaseTTL
 	}
 
-	localIP, err := GetLocalIP()
+	ctx, cancel := context.WithCancel(parent)
+	grantCtx, grantCancel := context.WithTimeout(ctx, 3*time.Second)
+	lease, err := cli.Grant(grantCtx, ttl)
+	grantCancel()
 	if err != nil {
-		cli.Close()
-		return fmt.Errorf("failed to get local IP: %v", err)
-	}
-	if addr[0] == ':' {
-		addr = fmt.Sprintf("%s%s", localIP, addr)
+		cancel()
+		return nil, fmt.Errorf("grant etcd lease: %w", err)
 	}
 
-	// 创建租约
-	lease, err := cli.Grant(context.Background(), 10) // 增加租约时间到10秒
+	putCtx, putCancel := context.WithTimeout(ctx, 3*time.Second)
+	_, err = cli.Put(putCtx, ServiceKey(svcName, addr), addr, clientv3.WithLease(lease.ID))
+	putCancel()
 	if err != nil {
-		cli.Close()
-		return fmt.Errorf("failed to create lease: %v", err)
+		cancel()
+		return nil, fmt.Errorf("register service in etcd: %w", err)
 	}
 
-	// 注册服务，使用完整的key路径
-	key := fmt.Sprintf("/services/%s/%s", svcName, addr)
-	_, err = cli.Put(context.Background(), key, addr, clientv3.WithLease(lease.ID))
+	keepAliveCh, err := cli.KeepAlive(ctx, lease.ID)
 	if err != nil {
-		cli.Close()
-		return fmt.Errorf("failed to put key-value to etcd: %v", err)
+		cancel()
+		return nil, fmt.Errorf("keep etcd lease alive: %w", err)
 	}
 
-	// 保持租约
-	keepAliveCh, err := cli.KeepAlive(context.Background(), lease.ID)
-	if err != nil {
-		cli.Close()
-		return fmt.Errorf("failed to keep lease alive: %v", err)
-	}
-
-	// 处理租约续期和服务注销
+	r := &Registration{cli: cli, leaseID: lease.ID, cancel: cancel, done: make(chan struct{})}
 	go func() {
-		defer cli.Close()
+		defer close(r.done)
 		for {
 			select {
-			case <-stopCh:
-				// 服务注销，撤销租约
-				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-				cli.Revoke(ctx, lease.ID)
-				cancel()
+			case <-ctx.Done():
 				return
 			case resp, ok := <-keepAliveCh:
 				if !ok {
-					logrus.Warn("keep alive channel closed")
+					if ctx.Err() == nil {
+						logrus.Warnf("etcd keepalive channel closed for %s", addr)
+					}
 					return
 				}
-				logrus.Debugf("successfully renewed lease: %d", resp.ID)
+				if resp != nil {
+					logrus.Debugf("renewed locache lease %d", resp.ID)
+				}
 			}
 		}
 	}()
 
-	logrus.Infof("Service registered: %s at %s", svcName, addr)
-	return nil
+	logrus.Infof("registered locache node %s as %s", addr, svcName)
+	return r, nil
+}
+
+func (r *Registration) Close(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	var revokeErr error
+	r.once.Do(func() {
+		r.cancel()
+		select {
+		case <-r.done:
+		case <-ctx.Done():
+			revokeErr = ctx.Err()
+		}
+		revokeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if _, err := r.cli.Revoke(revokeCtx, r.leaseID); err != nil && revokeErr == nil {
+			revokeErr = err
+		}
+	})
+	return revokeErr
+}
+
+// NormalizeAddress turns wildcard listen addresses such as :8001 or
+// 0.0.0.0:8001 into a routable advertised address. Explicit hostnames/IPs are
+// preserved.
+func NormalizeAddress(addr string) (string, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", fmt.Errorf("invalid address %q: %w", addr, err)
+	}
+	if port == "" {
+		return "", fmt.Errorf("missing port in address %q", addr)
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" || host == "[::]" {
+		host, err = GetLocalIP()
+		if err != nil {
+			return "", err
+		}
+	}
+	host = strings.Trim(host, "[]")
+	return net.JoinHostPort(host, port), nil
 }
 
 func GetLocalIP() (string, error) {
@@ -93,14 +145,12 @@ func GetLocalIP() (string, error) {
 	if err != nil {
 		return "", err
 	}
-
 	for _, addr := range addrs {
 		if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() {
-			if ipNet.IP.To4() != nil {
-				return ipNet.IP.String(), nil
+			if ip := ipNet.IP.To4(); ip != nil {
+				return ip.String(), nil
 			}
 		}
 	}
-
-	return "", fmt.Errorf("no valid local IP found")
+	return "", fmt.Errorf("no routable IPv4 address found")
 }
