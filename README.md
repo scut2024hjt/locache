@@ -2,6 +2,24 @@
 
 > 一个以内嵌 Library 形式运行的 Go 分布式缓存：一致性哈希确定 Key 的唯一 Owner，etcd 维护动态成员，gRPC 完成跨节点访问；支持显式 `Get / Set / Delete`、可选 read-through 回源，以及短 TTL Near Cache。
 
+[![Go](https://img.shields.io/badge/Go-1.22%2B-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/scut2024hjt/locache/actions/workflows/ci.yml/badge.svg)](https://github.com/scut2024hjt/locache/actions/workflows/ci.yml)
+
+## 30 秒速览
+
+- **是什么**：以 Library 形式与业务进程同进程运行的 Go 分布式缓存。**不是 Redis 的替代品，也不是数据库**——它把多台业务实例的内存组织成一个可动态扩缩容的缓存池。
+- **与普通本地缓存最核心的区别**：同一个 Key 在集群中只有一个 Owner，所有实例的冷 miss 都汇聚到它，再由 Owner 上的 singleflight 合并成**一次**下游回源。
+
+  ```text
+  Key → Consistent Hash → Owner → Owner Cache → singleflight → Source
+  ```
+
+- **三块实现**：etcd（Snapshot + Revision Watch）维护 membership 与一致的哈希环；gRPC + Protobuf 负责跨节点 `Get / Set / Delete`；节点内用 Sharded LRU + 分段锁管理缓存容量与 TTL。
+- **Near Cache 是可选项**：非 Owner 可保留短 TTL 副本以减少重复 RPC；`Set / Delete` 写完 Owner 后 best-effort 失效其他副本，失败由 TTL 兜底，因此接受**有界陈旧**。
+- **边界**：缓存不是 Source of Truth，`Set / Delete` 不替业务更新数据库；当前没有副本 Owner、quorum、Raft 或跨机房一致性协议。
+- **从哪看起**：[与普通本地缓存相比](#与普通本地缓存相比核心收益是什么) → [核心模型](#核心模型) → [Near Cache：性能与一致性的取舍](#near-cache性能与一致性的取舍)；跑起来看 [API 示例](#api-示例)，测试与已知边界见 [测试重点](#测试重点) 和 [边界](#边界)。
+
 ## 项目定位
 
 Locache 不是数据库，也不把缓存当作业务数据的 Source of Truth。业务数据仍由 MySQL、PostgreSQL 或下游服务保存；Locache 负责把多台业务实例的内存组织成一个可动态扩缩容的缓存池。
